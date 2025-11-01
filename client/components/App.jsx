@@ -10,6 +10,9 @@ export default function App() {
   const [messages, setMessages] = useState([]);
   const [assistantStream, setAssistantStream] = useState("");
   const [localStream, setLocalStream] = useState(null);
+  const [totalTokens, setTotalTokens] = useState(0);
+  const [contextString, setContextString] = useState("");
+  const [contextSummary, setContextSummary] = useState("");
   const assistantBuffer = useRef("");
   const userBuffer = useRef("");
   const currentVoiceMessageId = useRef(null);
@@ -17,6 +20,7 @@ export default function App() {
   const peerConnection = useRef(null);
   const audioElement = useRef(null);
   const [sessionId, setSessionId] = useState(null);
+  
 
   useEffect(() => {
     setIsClient(true);
@@ -142,7 +146,13 @@ export default function App() {
   }
 
   async function stopSession() {
-    logConversation({ sessionId:sessionId, role: "system", type: "session_end", message: "Session ended" });
+    logConversation({ 
+      sessionId:sessionId, 
+      role: "system", 
+      type: "session_end", 
+      message: "Session ended",
+      extras: { totalTokens }
+    });
     stopPeriodicFlush();
     await flushLogs();
     if (dataChannel) {
@@ -210,6 +220,7 @@ export default function App() {
       ...prev,
       { id: crypto.randomUUID(), role: "user", text: message },
     ]);
+    setContextString(prev => `${prev}\nUser: ${message}`);
     sendClientEvent({ type: "response.create" });
     logConversation({ sessionId:sessionId, role: "user", type: "chat", message: message });
   }
@@ -269,10 +280,24 @@ export default function App() {
           if (event.type === "response.content_part.done") {
             if (event.part?.type === "audio" && event.part.transcript) {
               const assistantMessage = event.part.transcript.trim();
-              setMessages((prev) => [
-                ...prev,
-                { id: crypto.randomUUID(), role: "assistant", text: assistantMessage },
-              ]);
+              
+              // Check if this is a response to our summary request
+              if (totalTokens >= 50000 && assistantMessage.includes("summary") || assistantMessage.includes("Summary")) {
+                setContextSummary(assistantMessage);
+                console.log('Context summary updated:', assistantMessage);
+                // Reset token count after getting summary
+                setTotalTokens(0);
+                // Clear context string since we have a summary now
+                setContextString("");
+              } else {
+                // Normal message handling
+                setMessages((prev) => [
+                  ...prev,
+                  { id: crypto.randomUUID(), role: "assistant", text: assistantMessage },
+                ]);
+                setContextString(prev => `${prev}\nAssistant: ${assistantMessage}`);
+              }
+              
               assistantBuffer.current = "";
               setAssistantStream("");
               logConversation({
@@ -288,12 +313,30 @@ export default function App() {
         if (event.type === "conversation.item.input_audio_transcription.completed") {
           const transcript = event.transcript;
           if (transcript) {
+            const transcriptText = transcript.trim();
             const id = crypto.randomUUID();
             setMessages((prev) => [
               ...prev,
-              { id, role: "user", text: transcript.trim() }
+              { id, role: "user", text: transcriptText }
             ]);
-            logConversation({ sessionId:sessionId, role: "user", type: "voice", message: transcript.trim() });
+            setContextString(prev => `${prev}\nUser: ${transcriptText}`);
+            logConversation({ sessionId:sessionId, role: "user", type: "voice", message: transcriptText });
+          }
+        }
+
+        if (event.type === "response.done") {
+          console.log('Received response.done event:', event);
+          const usage = event.response?.usage;
+          if (usage) {
+            console.log('Response usage data:', usage);
+            setTotalTokens(prev => {
+              const tokensToAdd = usage.total_tokens || 0;
+              const newTotal = prev + tokensToAdd;
+              console.log(`Token calculation: ${prev} + ${tokensToAdd} = ${newTotal}`);
+              return newTotal;
+            });
+          } else {
+            console.log('No usage data in response.done event');
           }
         }
         setEvents((prev) => [event, ...prev]);
@@ -304,12 +347,26 @@ export default function App() {
         setEvents([]);
         setMessages([]);
         setAssistantStream("");
+        setContextString("");
+        setTotalTokens(0);
         startPeriodicFlush();
         
         sendInvisiblePrompt("Say this phrase exactly: 'Hello! I'm an AI mental health support assistant here to listen and provide encouragement and coping ideas. I am not a licensed therapist or doctor, so I can't diagnose conditions or provide medical advice. Please remember, if you're in crisis, you should call the BYU Counseling and Psychological Services crisis line at (801) 422-3035. Also, please note that your microphone is off by default. If you'd like to talk using voice, you'll need to press the red mic toggle button to turn it on. And if you're comfortable, may I ask for your name?'");
       });
     }
   }, [dataChannel]);
+
+  // Handle high token count by requesting summary
+  useEffect(() => {
+    if (totalTokens >= 50000) {
+      console.log('WARNING - High token usage detected:', totalTokens);
+      
+      // Send context to AI and request summary
+      const summarizePrompt = `Here is the full conversation context. Please create a concise summary of the key points, emotions, and themes discussed. Keep the summary focused on therapeutic relevance. Here's the conversation:\n\n${contextString}\n\nPlease provide a summary that captures the essential context while being much more concise.`;
+      
+      sendInvisiblePrompt(summarizePrompt);
+    }
+  }, [totalTokens, contextString]);
 
   if (!isClient) {
     // Render a placeholder or nothing on the server
